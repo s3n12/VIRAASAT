@@ -1,0 +1,190 @@
+{
+  "entities": {
+    "UserPublic": {
+      "title": "UserPublic",
+      "description": "Public non-PII profile information for patrons, artisans, and administrators.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 2, "maxLength": 100 },
+        "role": { "type": "string", "enum": ["customer", "seller", "admin"] },
+        "atelierName": { "type": "string", "maxLength": 120 },
+        "craftRegion": { "type": "string", "maxLength": 80 },
+        "emailVerified": { "type": "boolean" },
+        "phoneVerified": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "role", "emailVerified", "phoneVerified", "createdAt", "updatedAt"]
+    },
+    "UserPrivate": {
+      "title": "UserPrivate",
+      "description": "Isolated PII record containing verified email, phone number, and default shipping address.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "phone": { "type": "string", "minLength": 10, "maxLength": 20, "pattern": "^\\+?[0-9\\-\\s]{10,20}$" },
+        "addressLine": { "type": "string", "maxLength": 240 },
+        "city": { "type": "string", "maxLength": 80 },
+        "state": { "type": "string", "maxLength": 80 },
+        "postalCode": { "type": "string", "maxLength": 12 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "phone", "updatedAt"]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "Authenticated luxury Indian artisan product listed in VIRAASAT.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "slug": { "type": "string", "minLength": 2, "maxLength": 140, "pattern": "^[a-z0-9\\-]+$" },
+        "title": { "type": "string", "minLength": 3, "maxLength": 160 },
+        "subtitle": { "type": "string", "maxLength": 200 },
+        "description": { "type": "string", "minLength": 10, "maxLength": 2000 },
+        "category": { "type": "string", "enum": ["Textiles & Weaves", "Fine Jewellery", "Brass & Metalcraft", "Kashmiri Shawls", "Attar & Perfumery"] },
+        "craftOrigin": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "atelierName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "sellerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "priceInr": { "type": "number" },
+        "stock": { "type": "number" },
+        "lowStockThreshold": { "type": "number" },
+        "imageUrl": { "type": "string", "maxLength": 500 },
+        "status": { "type": "string", "enum": ["active", "draft", "archived"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "slug", "title", "description", "category", "craftOrigin", "atelierName", "sellerId", "priceInr", "stock", "lowStockThreshold", "imageUrl", "status", "createdAt", "updatedAt"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "Customer order with Razorpay verification metadata and fulfillment lifecycle.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "sellerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "subtotalInr": { "type": "number" },
+        "taxInr": { "type": "number" },
+        "shippingInr": { "type": "number" },
+        "totalInr": { "type": "number" },
+        "paymentStatus": { "type": "string", "enum": ["pending", "authorized", "captured", "failed", "refunded"] },
+        "status": { "type": "string", "enum": ["placed", "confirmed", "crafted", "dispatched", "delivered", "cancelled", "refunded"] },
+        "razorpayOrderId": { "type": "string", "maxLength": 100 },
+        "razorpayPaymentId": { "type": "string", "maxLength": 100 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "sellerId", "subtotalInr", "taxInr", "shippingInr", "totalInr", "paymentStatus", "status", "createdAt", "updatedAt"]
+    },
+    "Review": {
+      "title": "Review",
+      "description": "Verified patron review for a heritage product.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "productId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "authorName": { "type": "string", "minLength": 2, "maxLength": 100 },
+        "rating": { "type": "number" },
+        "comment": { "type": "string", "minLength": 5, "maxLength": 1000 },
+        "verifiedPurchase": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "productId", "userId", "authorName", "rating", "comment", "verifiedPurchase", "createdAt"]
+    },
+    "WishlistItem": {
+      "title": "WishlistItem",
+      "description": "Saved heirloom item in a user's private wishlist.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "productId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "productId", "createdAt"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "User-scoped notification for orders, inventory alerts, and verification events.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 2, "maxLength": 140 },
+        "body": { "type": "string", "minLength": 2, "maxLength": 500 },
+        "read": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "title", "body", "read", "createdAt"]
+    },
+    "CmsSection": {
+      "title": "CmsSection",
+      "description": "Editorial storefront content managed by administrators.",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string", "minLength": 2, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "headline": { "type": "string", "minLength": 2, "maxLength": 180 },
+        "subheadline": { "type": "string", "maxLength": 400 },
+        "body": { "type": "string", "maxLength": 2000 },
+        "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["key", "headline", "updatedBy", "updatedAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable security and transaction audit log readable only by admins.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "action": { "type": "string", "minLength": 2, "maxLength": 100 },
+        "targetType": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "targetId": { "type": "string", "maxLength": 128 },
+        "outcome": { "type": "string", "enum": ["success", "denied", "failure"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "actorId", "action", "targetType", "outcome", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserPublic" },
+      "description": "Public non-PII user profiles."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivate" },
+      "description": "Strictly owner/admin isolated PII records."
+    },
+    "/users/{userId}/wishlist/{productId}": {
+      "schema": { "$ref": "#/entities/WishlistItem" },
+      "description": "User-scoped wishlist subcollection."
+    },
+    "/products/{productId}": {
+      "schema": { "$ref": "#/entities/Product" },
+      "description": "Publicly readable heritage product catalogue."
+    },
+    "/products/{productId}/reviews/{reviewId}": {
+      "schema": { "$ref": "#/entities/Review" },
+      "description": "Product reviews subcollection."
+    },
+    "/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/Order" },
+      "description": "Orders scoped to buyer, seller, and admin."
+    },
+    "/notifications/{notificationId}": {
+      "schema": { "$ref": "#/entities/Notification" },
+      "description": "Private user notifications."
+    },
+    "/cms/{sectionKey}": {
+      "schema": { "$ref": "#/entities/CmsSection" },
+      "description": "Publicly readable, admin-writable storefront editorial CMS."
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Immutable admin-only security audit log."
+    }
+  }
+}

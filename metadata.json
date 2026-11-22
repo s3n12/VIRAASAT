@@ -1,0 +1,6 @@
+{
+  "name": "VIRAASAT",
+  "description": "Luxury Indian heritage lifestyle and artisan marketplace featuring handloom textiles, Kundan jewellery, brass metalcraft, Kashmiri pashmina, and Kannauj perfumery with dual OTP verification and Razorpay checkout.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
