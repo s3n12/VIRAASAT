@@ -46,6 +46,8 @@ export interface NotificationPreferences {
   editorialNewsletter: boolean;
 }
 
+export type AccountStatus = 'pending_verification' | 'active' | 'suspended';
+
 export interface UserProfile {
   id: string;
   email: string;
@@ -58,6 +60,9 @@ export interface UserProfile {
   suspended?: boolean;
   emailVerified: boolean;
   phoneVerified: boolean;
+  emailVerifiedAt?: string | null;
+  phoneVerifiedAt?: string | null;
+  accountStatus?: AccountStatus;
   shippingAddress?: ShippingAddress;
   savedAddresses?: ShippingAddress[];
   notificationPreferences?: NotificationPreferences;

@@ -1,0 +1,67 @@
+# ==============================================================================
+# VIRAASAT — Supabase Project Auth Configuration Reference
+# Apply via Supabase CLI (`supabase config push`) or mirror in Supabase Dashboard
+# under Authentication -> Providers, Email Templates, SMTP Settings & Auth Hooks.
+# ==============================================================================
+
+[auth]
+enabled = true
+site_url = "https://your-viraasat-domain.com"
+additional_redirect_urls = ["http://localhost:3000"]
+jwt_expiry = 3600
+enable_refresh_token_rotation = true
+refresh_token_reuse_interval = 10
+enable_signup = true
+enable_anonymous_sign_ins = false
+
+[auth.rate_limit]
+# Strict anti-abuse OTP rate limiting
+email_sent = 10
+sms_sent = 10
+token_verifications = 15
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+enable_confirmations = true
+# 5-minute Email OTP expiry (300 seconds) & 6-digit OTP length
+otp_length = 6
+otp_expiry = 300
+max_frequency = "60s"
+
+[auth.email.smtp]
+enabled = true
+host = "smtp.resend.com"
+port = 465
+user = "resend"
+pass = "env(RESEND_API_KEY)"
+admin_email = "auth@your-verified-domain.com"
+sender_name = "VIRAASAT Concierge"
+
+[auth.email.template.magic_link]
+subject = "Your VIRAASAT Verification Code: {{ .Token }}"
+content_path = "./supabase/templates/email-otp.html"
+
+[auth.email.template.confirmation]
+subject = "Verify Your VIRAASAT Email: {{ .Token }}"
+content_path = "./supabase/templates/email-otp.html"
+
+[auth.sms]
+enable_signup = true
+enable_confirmations = true
+# 5-minute SMS OTP expiry (300 seconds) & 60-second resend frequency
+max_frequency = "60s"
+
+# Supabase Custom Send SMS Hook -> forwards exact Supabase OTP to MSG91
+[auth.hook.send_sms]
+enabled = true
+# Use either your deployed Supabase Edge Function URL OR your app HTTPS endpoint:
+#   https://<YOUR_PROJECT_REF>.supabase.co/functions/v1/send-sms-hook
+#   OR https://<YOUR_APP_DOMAIN>/api/webhooks/supabase/send-sms
+uri = "https://<YOUR_PROJECT_REF>.supabase.co/functions/v1/send-sms-hook"
+secrets = "env(SUPABASE_SMS_HOOK_SECRET)"
+
+[auth.captcha]
+enabled = true
+provider = "turnstile"
+secret = "env(TURNSTILE_SECRET_KEY)"

@@ -8,41 +8,99 @@ import {
   checkResendCooldown,
   createOtpChallenge,
   normalizeIdentifier,
+  normalizeIndianPhone,
   signRazorpayPayment,
   signRazorpayWebhookPayload,
   signSessionToken,
+  signStandardWebhookPayload,
   verifyOtpChallenge,
   verifyRazorpayPaymentSignature,
   verifyRazorpayWebhookSignature,
   verifySessionToken,
+  verifyStandardWebhookSignature,
 } from './security';
 
 const TEST_SECRET = 'unit_test_hmac_secret_value_for_tests_only';
 
-test('OTP challenge verifies valid code once and blocks replay', () => {
-  const now = 1_700_000_000_000;
-  const { record, code } = createOtpChallenge('Patron@Viraasat.IN ', 'email', TEST_SECRET, now);
-
-  assert.equal(record.identifier, 'patron@viraasat.in');
-  assert.equal(code.length, 6);
-  assert.notEqual(record.codeHash, code);
-
-  const first = verifyOtpChallenge(record, code, TEST_SECRET, now + 5_000);
-  assert.deepEqual(first, { ok: true });
-
-  const replay = verifyOtpChallenge(record, code, TEST_SECRET, now + 6_000);
-  assert.equal(replay.ok, false);
-  if (!replay.ok) assert.equal(replay.code, 'CONSUMED');
+test('normalizeIndianPhone validates Indian +91 mobile numbers strictly', () => {
+  assert.deepEqual(normalizeIndianPhone('+91 98765 43210'), {
+    e164: '+919876543210',
+    msg91Mobile: '919876543210',
+    national10: '9876543210',
+  });
+  assert.deepEqual(normalizeIndianPhone('9876543210'), {
+    e164: '+919876543210',
+    msg91Mobile: '919876543210',
+    national10: '9876543210',
+  });
+  assert.equal(normalizeIndianPhone('+14155550199'), null);
+  assert.equal(normalizeIndianPhone('+911234567890'), null); // must start with 6-9
+  assert.equal(normalizeIndianPhone('98765'), null);
 });
 
-test('OTP challenge enforces expiry, attempt limits, and resend cooldown', () => {
+test('Standard Webhooks HMAC-SHA256 verification validates Supabase Send SMS Hook and blocks tampering/replay', () => {
+  const hookSecret = `v1,whsec_${Buffer.from('super_secret_supabase_sms_hook_key_32b').toString('base64')}`;
+  const rawBody = JSON.stringify({
+    user: { id: 'uid_1', phone: '+919876543210' },
+    sms: { otp: '654321' },
+  });
+  const nowSec = 1_750_000_000;
+  const webhookId = 'msg_test_001';
+  const webhookTimestamp = String(nowSec);
+
+  const validSig = signStandardWebhookPayload({
+    webhookId,
+    webhookTimestamp,
+    rawBody,
+    hookSecret,
+  });
+
+  assert.deepEqual(
+    verifyStandardWebhookSignature({
+      webhookId,
+      webhookTimestamp,
+      webhookSignatureHeader: validSig,
+      rawBody,
+      hookSecret,
+      nowSec: nowSec + 10,
+    }),
+    { ok: true }
+  );
+
+  // Tampered body rejected
+  const tampered = verifyStandardWebhookSignature({
+    webhookId,
+    webhookTimestamp,
+    webhookSignatureHeader: validSig,
+    rawBody: rawBody.replace('654321', '999999'),
+    hookSecret,
+    nowSec: nowSec + 10,
+  });
+  assert.equal(tampered.ok, false);
+
+  // Expired timestamp outside 5-minute window rejected
+  const stale = verifyStandardWebhookSignature({
+    webhookId,
+    webhookTimestamp,
+    webhookSignatureHeader: validSig,
+    rawBody,
+    hookSecret,
+    nowSec: nowSec + 400,
+  });
+  assert.equal(stale.ok, false);
+});
+
+test('OTP challenge enforces 5-min expiry, 60s resend cooldown, attempt limits, and replay protection', () => {
   const now = 1_700_000_000_000;
+  assert.equal(OTP_TTL_MS, 5 * 60 * 1000);
+  assert.equal(OTP_RESEND_COOLDOWN_MS, 60 * 1000);
+
   const { record, code } = createOtpChallenge('9876543210', 'phone', TEST_SECRET, now);
   assert.equal(normalizeIdentifier('9876543210', 'phone'), '+919876543210');
 
-  const cooldownBlocked = checkResendCooldown(record, now + 10_000);
+  const cooldownBlocked = checkResendCooldown(record, now + 30_000);
   assert.equal(cooldownBlocked.allowed, false);
-  assert.ok(cooldownBlocked.retryAfterSec > 0);
+  assert.ok(cooldownBlocked.retryAfterSec >= 29);
 
   const cooldownPassed = checkResendCooldown(record, now + OTP_RESEND_COOLDOWN_MS + 100);
   assert.equal(cooldownPassed.allowed, true);

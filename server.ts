@@ -14,21 +14,32 @@ import {
   getEffectiveProductPrice,
 } from './src/lib/commerce.ts';
 import {
+  OTP_MAX_ATTEMPTS,
   OTP_RESEND_COOLDOWN_MS,
   OTP_TTL_MS,
   SlidingWindowRateLimiter,
-  checkResendCooldown,
-  createOtpChallenge,
   normalizeIdentifier,
+  normalizeIndianPhone,
   sanitizeExternalUrl,
   signRazorpayPayment,
   signRazorpayWebhookPayload,
-  signSessionToken,
-  verifyOtpChallenge,
   verifyRazorpayPaymentSignature,
   verifyRazorpayWebhookSignature,
   verifySessionToken,
+  verifyStandardWebhookSignature,
 } from './src/lib/security.ts';
+import {
+  createSupabaseAdminClient,
+  createSupabaseAnonClient,
+  getAuthProviderStatus,
+  mapSupabaseAuthError,
+  readSupabaseAuthEnv,
+  requestSupabasePhoneChangeOtp,
+  sendOtpViaMsg91,
+  syncProfileFromSupabaseUser,
+  verifyTurnstileToken,
+  type SupabaseAuthEnvConfig,
+} from './src/server/supabaseAuth.ts';
 import { IMAGES, createSeedStore, type MarketplaceStore } from './src/server/store.ts';
 import type {
   AdminAnalytics,
@@ -70,20 +81,16 @@ interface AuthedRequest extends Request {
 export interface ServerOptions {
   store?: MarketplaceStore;
   sessionSecret?: string;
-  otpHmacSecret?: string;
   razorpayKeyId?: string;
   razorpayKeySecret?: string;
   razorpayWebhookSecret?: string;
+  supabaseAuth?: Partial<SupabaseAuthEnvConfig>;
 }
 
 export function createViraasatApiApp(options: ServerOptions = {}) {
   const SESSION_SECRET =
     options.sessionSecret ||
     process.env.SESSION_SECRET ||
-    crypto.randomBytes(32).toString('hex');
-  const OTP_HMAC_SECRET =
-    options.otpHmacSecret ||
-    process.env.OTP_HMAC_SECRET ||
     crypto.randomBytes(32).toString('hex');
   const RAZORPAY_KEY_ID = options.razorpayKeyId ?? (process.env.RAZORPAY_KEY_ID || '');
   const RAZORPAY_KEY_SECRET =
@@ -99,15 +106,17 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
     (options.razorpayKeyId || process.env.RAZORPAY_KEY_ID) &&
       (options.razorpayKeySecret || process.env.RAZORPAY_KEY_SECRET)
   );
-  const HAS_EXTERNAL_OTP_PROVIDERS = Boolean(
-    (process.env.RESEND_API_KEY || process.env.SMTP_HOST) &&
-      (process.env.MSG91_AUTH_KEY || process.env.TWILIO_ACCOUNT_SID)
-  );
+
+  const supabaseCfg = readSupabaseAuthEnv(options.supabaseAuth);
+  const authStatus = getAuthProviderStatus(supabaseCfg);
 
   const store = options.store || createSeedStore();
-  const otpRequestLimiter = new SlidingWindowRateLimiter(12, 5 * 60 * 1000);
-  const otpVerifyLimiter = new SlidingWindowRateLimiter(20, 5 * 60 * 1000);
+  const otpRequestLimiter = new SlidingWindowRateLimiter(10, 5 * 60 * 1000);
+  const otpVerifyLimiter = new SlidingWindowRateLimiter(15, 5 * 60 * 1000);
   const apiMutationLimiter = new SlidingWindowRateLimiter(100, 60 * 1000);
+  const otpResendCooldowns = new Map<string, number>();
+  const otpFailedAttempts = new Map<string, { count: number; resetAtMs: number }>();
+  const processedSmsHookIds = new Set<string>();
 
   function getClientIp(req: Request): string {
     const fwd = req.headers['x-forwarded-for'];
@@ -170,28 +179,60 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
     return undefined;
   }
 
-  function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
+  async function resolveAuthenticatedUser(token: string): Promise<UserProfile | null> {
+    if (!token || store.revokedTokens.has(token)) {
+      return null;
+    }
+
+    // Primary authentication source: Supabase Auth JWT validated server-side
+    if (authStatus.supabaseAuthConfigured) {
+      try {
+        const sbClient = supabaseCfg.supabaseServiceRoleKey
+          ? createSupabaseAdminClient(supabaseCfg)
+          : createSupabaseAnonClient(supabaseCfg);
+        const { data, error } = await sbClient.auth.getUser(token);
+        if (!error && data?.user) {
+          const existing =
+            store.users.get(data.user.id) ||
+            (data.user.email ? findUserByEmail(data.user.email) : undefined);
+          const synced = await syncProfileFromSupabaseUser({
+            sbUser: data.user,
+            cfg: supabaseCfg,
+            existingLocal: existing,
+          });
+          store.users.set(synced.id, synced);
+          return synced;
+        }
+      } catch {
+        return null;
+      }
+      return null;
+    }
+
+    // Fallback check only for pre-signed tokens in isolated unit/integration tests
+    const payload = verifySessionToken(token, SESSION_SECRET);
+    if (!payload) return null;
+    return store.users.get(payload.sub) || null;
+  }
+
+  async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
     const header = req.headers.authorization;
     if (!header || !header.startsWith('Bearer ')) {
-      res.status(401).json({ error: 'Authentication required.' });
+      res.status(401).json({ error: 'Authentication required. Please sign in with verified OTP.' });
       return;
     }
     const token = header.slice(7).trim();
     if (store.revokedTokens.has(token)) {
-      res.status(401).json({ error: 'Session has been revoked. Please sign in again.' });
+      res.status(401).json({ error: 'Your session has been signed out. Please sign in again.' });
       return;
     }
-    const payload = verifySessionToken(token, SESSION_SECRET);
-    if (!payload) {
-      res.status(401).json({ error: 'Invalid or expired session token.' });
-      return;
-    }
-    const user = store.users.get(payload.sub);
+
+    const user = await resolveAuthenticatedUser(token);
     if (!user) {
-      res.status(401).json({ error: 'Account not found.' });
+      res.status(401).json({ error: 'Invalid or expired authentication session. Please sign in again.' });
       return;
     }
-    if (user.suspended) {
+    if (user.suspended || user.accountStatus === 'suspended') {
       res.status(403).json({ error: 'Your account has been suspended. Contact VIRAASAT concierge.' });
       return;
     }
@@ -249,19 +290,30 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
     };
   }
 
-  // Validation schemas
-  const otpRequestSchema = z.object({
-    channel: z.enum(['email', 'phone']),
-    identifier: z.string().min(5).max(254),
+  // Validation schemas for Supabase Auth Dual OTP
+  const emailOtpSendSchema = z.object({
+    email: z.string().email('Please enter a valid email address.').max(254),
+    intent: z.enum(['register', 'login']).default('register'),
+    displayName: z.string().min(2, 'Please enter your full name (min 2 characters).').max(100).optional(),
+    captchaToken: z.string().max(4096).optional(),
   });
 
-  const otpVerifySchema = z.object({
-    channel: z.enum(['email', 'phone']),
-    identifier: z.string().min(5).max(254),
-    code: z.string().regex(/^\d{6}$/, 'OTP must be a 6-digit numeric code'),
-    email: z.string().email().optional(),
-    phone: z.string().min(10).max(20).optional(),
+  const emailOtpVerifySchema = z.object({
+    email: z.string().email('Please enter a valid email address.').max(254),
+    code: z.string().regex(/^\d{6}$/, 'Enter the 6-digit numeric email OTP.'),
     displayName: z.string().min(2).max(100).optional(),
+  });
+
+  const phoneOtpSendSchema = z.object({
+    phone: z.string().min(10, 'Enter a valid 10-digit Indian mobile number with +91.').max(20),
+    intent: z.enum(['register', 'login']).default('register'),
+    captchaToken: z.string().max(4096).optional(),
+  });
+
+  const phoneOtpVerifySchema = z.object({
+    phone: z.string().min(10).max(20),
+    code: z.string().regex(/^\d{6}$/, 'Enter the 6-digit numeric SMS OTP.'),
+    intent: z.enum(['register', 'login']).default('register'),
   });
 
   const productPayloadSchema = z.object({
@@ -368,7 +420,8 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
 
     const isMutation = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method);
-    const isWebhook = req.path === '/webhooks/razorpay';
+    const isWebhook =
+      req.path === '/webhooks/razorpay' || req.path === '/webhooks/supabase/send-sms';
     if (isMutation && !isWebhook && req.headers.origin) {
       const requestedWith = req.headers['x-requested-with'];
       const hasBearer = req.headers.authorization?.startsWith('Bearer ');
@@ -385,8 +438,9 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
     res.json({
       ok: true,
       service: 'viraasat-api',
+      authProvider: authStatus.supabaseAuthConfigured ? 'supabase_auth' : 'unconfigured',
+      smsHookConfigured: authStatus.smsHookConfigured,
       paymentMode: HAS_LIVE_RAZORPAY ? 'razorpay_live' : 'razorpay_sandbox',
-      otpDeliveryMode: HAS_EXTERNAL_OTP_PROVIDERS ? 'live_provider' : 'preview_sandbox',
       timestamp: new Date().toISOString(),
     });
   });
@@ -403,324 +457,727 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
   });
 
   // =========================================================================
-  // AUTH: DUAL EMAIL + PHONE OTP + FIREBASE SYNC + SECURE SESSIONS
+  // AUTH: REAL SUPABASE AUTH DUAL OTP (EMAIL VIA RESEND SMTP + PHONE VIA MSG91)
+  // Supabase Auth is the single source of truth. Zero fake/demo OTPs.
   // =========================================================================
-  router.post('/auth/otp/request', (req: AuthedRequest, res: Response) => {
+  router.get('/auth/config', (_req, res) => {
+    res.json({
+      ...authStatus,
+      otpExpirySeconds: Math.floor(OTP_TTL_MS / 1000),
+      resendCooldownSeconds: Math.floor(OTP_RESEND_COOLDOWN_MS / 1000),
+      maxAttempts: OTP_MAX_ATTEMPTS,
+    });
+  });
+
+  function checkAndRecordResendCooldown(key: string): { allowed: boolean; retryAfterSec: number } {
+    const now = Date.now();
+    const until = otpResendCooldowns.get(key) || 0;
+    if (until > now) {
+      return { allowed: false, retryAfterSec: Math.ceil((until - now) / 1000) };
+    }
+    return { allowed: true, retryAfterSec: 0 };
+  }
+
+  function isAttemptLocked(key: string): { locked: boolean; retryAfterSec: number; remaining: number } {
+    const now = Date.now();
+    const entry = otpFailedAttempts.get(key);
+    if (!entry || entry.resetAtMs <= now) {
+      otpFailedAttempts.delete(key);
+      return { locked: false, retryAfterSec: 0, remaining: OTP_MAX_ATTEMPTS };
+    }
+    if (entry.count >= OTP_MAX_ATTEMPTS) {
+      return {
+        locked: true,
+        retryAfterSec: Math.max(1, Math.ceil((entry.resetAtMs - now) / 1000)),
+        remaining: 0,
+      };
+    }
+    return { locked: false, retryAfterSec: 0, remaining: OTP_MAX_ATTEMPTS - entry.count };
+  }
+
+  function recordFailedAttempt(key: string): number {
+    const now = Date.now();
+    const existing = otpFailedAttempts.get(key);
+    if (!existing || existing.resetAtMs <= now) {
+      otpFailedAttempts.set(key, { count: 1, resetAtMs: now + OTP_TTL_MS });
+      return OTP_MAX_ATTEMPTS - 1;
+    }
+    existing.count += 1;
+    otpFailedAttempts.set(key, existing);
+    return Math.max(0, OTP_MAX_ATTEMPTS - existing.count);
+  }
+
+  // 1A. SEND REAL EMAIL OTP VIA SUPABASE AUTH (DELIVERED VIA RESEND SMTP)
+  router.post('/auth/otp/email/send', async (req: AuthedRequest, res: Response) => {
     const ip = getClientIp(req);
-    const parsed = otpRequestSchema.safeParse(req.body);
+    if (!authStatus.supabaseAuthConfigured) {
+      res.status(503).json({
+        error:
+          'Supabase Auth is not connected yet. Configure SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY in server secrets to send real Email OTPs.',
+        code: 'SUPABASE_AUTH_NOT_CONFIGURED',
+        missingVariables: authStatus.missingVariables,
+      });
+      return;
+    }
+
+    const parsed = emailOtpSendSchema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid input.' });
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid email OTP request.' });
       return;
     }
 
-    const { channel, identifier } = parsed.data;
-    const normalized = normalizeIdentifier(identifier, channel);
-    if (channel === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
-      res.status(400).json({ error: 'Please enter a valid email address.' });
-      return;
-    }
-    if (channel === 'phone' && !/^\+\d{10,15}$/.test(normalized)) {
-      res.status(400).json({ error: 'Please enter a valid 10-digit Indian or E.164 phone number.' });
+    const { intent, displayName, captchaToken } = parsed.data;
+    if (intent === 'register' && (!displayName || displayName.trim().length < 2)) {
+      res.status(400).json({ error: 'Please enter your full name to register.' });
       return;
     }
 
-    const rateKey = `otp_req:${ip}:${channel}:${normalized}`;
-    const limit = otpRequestLimiter.consume(rateKey);
-    if (!limit.allowed) {
+    const email = normalizeIdentifier(parsed.data.email, 'email');
+
+    const captcha = await verifyTurnstileToken({ token: captchaToken, ipAddress: ip, cfg: supabaseCfg });
+    if (!captcha.ok) {
+      res.status(400).json({ error: captcha.error, code: 'CAPTCHA_FAILED' });
+      return;
+    }
+
+    const rate = otpRequestLimiter.consume(`email_send:${ip}:${email}`);
+    if (!rate.allowed) {
       addAuditLog({
         actorId: 'anonymous',
-        actorEmail: normalized,
-        action: 'OTP_RATE_LIMITED',
+        actorEmail: email,
+        action: 'EMAIL_OTP_RATE_LIMITED',
         targetType: 'auth',
         outcome: 'denied',
         ipAddress: ip,
-        detail: `Rate limit exceeded on ${channel} OTP request.`,
+        detail: 'Exceeded email OTP request rate limit.',
       });
       res.status(429).json({
-        error: `Too many OTP requests. Please wait ${limit.retryAfterSec}s before trying again.`,
-        retryAfterSec: limit.retryAfterSec,
+        error: `Too many email OTP requests. Please wait ${rate.retryAfterSec}s before trying again.`,
+        retryAfterSec: rate.retryAfterSec,
       });
       return;
     }
 
-    const challengeKey = `${channel}:${normalized}`;
-    const existing = store.otpChallenges.get(challengeKey);
-    const cooldown = checkResendCooldown(existing);
+    const cooldownKey = `email:${email}`;
+    const cooldown = checkAndRecordResendCooldown(cooldownKey);
     if (!cooldown.allowed) {
       res.status(429).json({
-        error: `Please wait ${cooldown.retryAfterSec}s before requesting a new ${channel} OTP.`,
+        error: `Please wait ${cooldown.retryAfterSec}s before resending the email OTP.`,
         retryAfterSec: cooldown.retryAfterSec,
       });
       return;
     }
 
-    const { record, code } = createOtpChallenge(normalized, channel, OTP_HMAC_SECRET);
-    store.otpChallenges.set(challengeKey, record);
-
-    addAuditLog({
-      actorId: 'anonymous',
-      actorEmail: normalized,
-      action: 'OTP_REQUESTED',
-      targetType: 'auth',
-      targetId: channel,
-      outcome: 'success',
-      ipAddress: ip,
-      detail: `Dispatched ${channel} OTP challenge (TTL ${OTP_TTL_MS / 1000}s).`,
-    });
-
-    const responsePayload: Record<string, unknown> = {
-      ok: true,
-      channel,
-      normalizedIdentifier: normalized,
-      expiresInSec: Math.floor(OTP_TTL_MS / 1000),
-      resendCooldownSec: Math.floor(OTP_RESEND_COOLDOWN_MS / 1000),
-      message:
-        'If these details are eligible, a 6-digit verification code has been dispatched.',
-    };
-
-    if (!IS_PROD && !HAS_EXTERNAL_OTP_PROVIDERS) {
-      responsePayload.deliveryMode = 'preview';
-      responsePayload.previewCode = code;
-    }
-
-    res.json(responsePayload);
-  });
-
-  router.post('/auth/otp/verify', (req: AuthedRequest, res: Response) => {
-    const ip = getClientIp(req);
-    const parsed = otpVerifySchema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid OTP payload.' });
-      return;
-    }
-
-    const { channel, identifier, code, email, phone, displayName } = parsed.data;
-    const normalized = normalizeIdentifier(identifier, channel);
-    const limit = otpVerifyLimiter.consume(`otp_ver:${ip}:${channel}:${normalized}`);
-    if (!limit.allowed) {
-      res.status(429).json({
-        error: `Too many verification attempts. Try again in ${limit.retryAfterSec}s.`,
+    try {
+      const supabase = createSupabaseAnonClient(supabaseCfg);
+      const { error } = await supabase.auth.signInWithOtp({
+        email,
+        options: {
+          shouldCreateUser: intent === 'register',
+          data: displayName ? { display_name: displayName.trim() } : undefined,
+          captchaToken,
+        },
       });
-      return;
-    }
 
-    const challengeKey = `${channel}:${normalized}`;
-    const record = store.otpChallenges.get(challengeKey);
-    const result = verifyOtpChallenge(record, code, OTP_HMAC_SECRET);
+      if (error) {
+        console.error('Supabase signInWithOtp (email) failed:', error.message);
+        const mapped = mapSupabaseAuthError(error.message);
+        addAuditLog({
+          actorId: 'anonymous',
+          actorEmail: email,
+          action: 'EMAIL_OTP_SEND_FAILED',
+          targetType: 'auth',
+          outcome: 'failure',
+          ipAddress: ip,
+          detail: `Supabase Email OTP send failed: ${error.message}`,
+        });
+        res.status(mapped.status).json({ error: mapped.error });
+        return;
+      }
 
-    if (!result.ok) {
+      otpResendCooldowns.set(cooldownKey, Date.now() + OTP_RESEND_COOLDOWN_MS);
+      otpFailedAttempts.delete(`ver_email:${email}`);
+
       addAuditLog({
         actorId: 'anonymous',
-        actorEmail: normalized,
-        action: 'OTP_VERIFY_FAILED',
+        actorEmail: email,
+        action: 'EMAIL_OTP_DISPATCHED',
         targetType: 'auth',
-        targetId: channel,
-        outcome: 'failure',
+        targetId: intent,
+        outcome: 'success',
         ipAddress: ip,
-        detail: `OTP verification failed (${result.code}, remaining=${result.remainingAttempts}).`,
+        detail: `Supabase Auth dispatched real 6-digit email OTP (${intent}) via Resend SMTP.`,
       });
-      const errorMap = {
-        NOT_FOUND: 'No active OTP challenge found. Request a fresh code.',
-        CONSUMED: 'This code has already been used. Request a new code.',
-        EXPIRED: 'This verification code has expired. Request a new code.',
-        MAX_ATTEMPTS: 'Maximum verification attempts exceeded. Request a fresh code.',
-        INVALID_CODE: `Invalid verification code. ${result.remainingAttempts} attempt(s) remaining.`,
-      };
-      res.status(400).json({
-        error: errorMap[result.code],
-        code: result.code,
-        remainingAttempts: result.remainingAttempts,
+
+      res.json({
+        ok: true,
+        channel: 'email',
+        normalizedIdentifier: email,
+        expiresInSec: Math.floor(OTP_TTL_MS / 1000),
+        resendCooldownSec: Math.floor(OTP_RESEND_COOLDOWN_MS / 1000),
+        message: `A 6-digit verification code has been sent to ${email}. Check your inbox (expires in 5 minutes).`,
       });
-      return;
+    } catch (err) {
+      res.status(502).json({
+        error: `Unable to reach Supabase Auth email service: ${err instanceof Error ? err.message : 'network error'}`,
+      });
     }
-
-    let user: UserProfile | undefined;
-    const authHeader = req.headers.authorization;
-    if (authHeader?.startsWith('Bearer ')) {
-      const existingToken = authHeader.slice(7).trim();
-      const payload = verifySessionToken(existingToken, SESSION_SECRET);
-      if (payload && !store.revokedTokens.has(existingToken)) {
-        user = store.users.get(payload.sub);
-      }
-    }
-
-    if (!user) {
-      if (channel === 'email') {
-        user = findUserByEmail(normalized);
-      } else {
-        user = findUserByPhone(normalized);
-        if (!user && email) {
-          user = findUserByEmail(email);
-        }
-      }
-    }
-
-    if (user?.suspended) {
-      res.status(403).json({ error: 'This account is suspended. Contact VIRAASAT support.' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    if (!user) {
-      const resolvedEmail =
-        channel === 'email'
-          ? normalized
-          : email
-            ? normalizeIdentifier(email, 'email')
-            : `patron.${crypto.randomBytes(3).toString('hex')}@viraasat.in`;
-      const resolvedPhone =
-        channel === 'phone'
-          ? normalized
-          : phone
-            ? normalizeIdentifier(phone, 'phone')
-            : '';
-
-      const newId = `usr_${crypto.randomBytes(6).toString('hex')}`;
-      const isBootstrappedAdmin = resolvedEmail === 'shaninishad813@gmail.com';
-      user = {
-        id: newId,
-        email: resolvedEmail,
-        phone: resolvedPhone,
-        displayName:
-          displayName?.trim() ||
-          resolvedEmail
-            .split('@')[0]
-            .replace(/[._-]+/g, ' ')
-            .replace(/\b\w/g, (c) => c.toUpperCase()),
-        role: isBootstrappedAdmin ? 'admin' : 'customer',
-        sellerVerified: isBootstrappedAdmin,
-        suspended: false,
-        emailVerified: channel === 'email',
-        phoneVerified: channel === 'phone',
-        savedAddresses: [],
-        notificationPreferences: {
-          orderEmail: true,
-          orderSms: true,
-          securityAlerts: true,
-          editorialNewsletter: true,
-        },
-        createdAt: now,
-        updatedAt: now,
-      };
-      store.users.set(user.id, user);
-      addNotification(
-        user.id,
-        'Welcome to VIRAASAT',
-        'Complete both email and phone verification to unlock insured checkout and collector orders.',
-        'security'
-      );
-    } else {
-      if (channel === 'email') {
-        user.email = normalized;
-        user.emailVerified = true;
-      } else {
-        user.phone = normalized;
-        user.phoneVerified = true;
-      }
-      if (displayName?.trim()) {
-        user.displayName = displayName.trim();
-      }
-      user.updatedAt = now;
-    }
-
-    const token = signSessionToken(
-      { sub: user.id, email: user.email, role: user.role },
-      SESSION_SECRET
-    );
-
-    addAuditLog({
-      actorId: user.id,
-      actorEmail: user.email,
-      action: channel === 'email' ? 'EMAIL_OTP_VERIFIED' : 'PHONE_OTP_VERIFIED',
-      targetType: 'user',
-      targetId: user.id,
-      outcome: 'success',
-      ipAddress: ip,
-      detail: `Verified ${channel} (${normalized}). Dual status: email=${user.emailVerified}, phone=${user.phoneVerified}.`,
-    });
-
-    res.json({
-      ok: true,
-      token,
-      user,
-      dualVerified: user.emailVerified && user.phoneVerified,
-    });
   });
 
-  router.post('/auth/firebase-sync', (req: AuthedRequest, res: Response) => {
-    const schema = z.object({
-      uid: z.string().min(4).max(128),
-      email: z.string().email(),
-      displayName: z.string().min(1).max(100),
-      emailVerified: z.boolean(),
-    });
-    const parsed = schema.safeParse(req.body);
+  // 1B. VERIFY REAL EMAIL OTP VIA SUPABASE AUTH
+  router.post('/auth/otp/email/verify', async (req: AuthedRequest, res: Response) => {
+    const ip = getClientIp(req);
+    if (!authStatus.supabaseAuthConfigured) {
+      res.status(503).json({
+        error: 'Supabase Auth is not connected yet. Configure Supabase credentials first.',
+        code: 'SUPABASE_AUTH_NOT_CONFIGURED',
+        missingVariables: authStatus.missingVariables,
+      });
+      return;
+    }
+
+    const parsed = emailOtpVerifySchema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: 'Invalid Firebase identity payload.' });
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid email OTP payload.' });
       return;
     }
 
-    const { email, displayName, emailVerified } = parsed.data;
-    const normalizedEmail = email.toLowerCase();
-    let user = findUserByEmail(normalizedEmail);
-    const now = new Date().toISOString();
+    const email = normalizeIdentifier(parsed.data.email, 'email');
+    const code = parsed.data.code.trim();
 
-    if (user?.suspended) {
-      res.status(403).json({ error: 'This account is suspended.' });
+    const rate = otpVerifyLimiter.consume(`email_ver:${ip}:${email}`);
+    if (!rate.allowed) {
+      res.status(429).json({
+        error: `Too many verification attempts. Please wait ${rate.retryAfterSec}s.`,
+        retryAfterSec: rate.retryAfterSec,
+      });
       return;
     }
 
-    if (!user) {
-      const isBootstrappedAdmin =
-        normalizedEmail === 'shaninishad813@gmail.com' && emailVerified;
-      user = {
-        id: `usr_${crypto.randomBytes(6).toString('hex')}`,
-        email: normalizedEmail,
-        phone: '',
-        displayName,
-        role: isBootstrappedAdmin ? 'admin' : 'customer',
-        sellerVerified: isBootstrappedAdmin,
-        suspended: false,
-        emailVerified,
-        phoneVerified: false,
-        savedAddresses: [],
-        notificationPreferences: {
-          orderEmail: true,
-          orderSms: true,
-          securityAlerts: true,
-          editorialNewsletter: true,
-        },
-        createdAt: now,
-        updatedAt: now,
-      };
+    const attemptKey = `ver_email:${email}`;
+    const lock = isAttemptLocked(attemptKey);
+    if (lock.locked) {
+      res.status(429).json({
+        error: `Maximum verification attempts (${OTP_MAX_ATTEMPTS}) reached. Request a fresh Email OTP in ${lock.retryAfterSec}s.`,
+        code: 'MAX_ATTEMPTS',
+        remainingAttempts: 0,
+      });
+      return;
+    }
+
+    try {
+      const supabase = createSupabaseAnonClient(supabaseCfg);
+      const { data, error } = await supabase.auth.verifyOtp({
+        email,
+        token: code,
+        type: 'email',
+      });
+
+      if (error || !data?.user || !data?.session?.access_token) {
+        if (error) {
+          console.error('Supabase verifyOtp (email) failed:', error.message);
+        }
+        const remaining = recordFailedAttempt(attemptKey);
+        const mapped = mapSupabaseAuthError(error?.message || 'Invalid or expired OTP.');
+        addAuditLog({
+          actorId: 'anonymous',
+          actorEmail: email,
+          action: 'EMAIL_OTP_VERIFY_FAILED',
+          targetType: 'auth',
+          outcome: 'failure',
+          ipAddress: ip,
+          detail: `Supabase rejected email OTP (remaining=${remaining}): ${error?.message || 'no session'}`,
+        });
+        res.status(mapped.status).json({
+          error:
+            remaining === 0
+              ? 'Maximum verification attempts exceeded. Please request a fresh Email OTP.'
+              : `${mapped.error} (${remaining} attempt(s) remaining)`,
+          code: remaining === 0 ? 'MAX_ATTEMPTS' : 'INVALID_OTP',
+          remainingAttempts: remaining,
+        });
+        return;
+      }
+
+      if (!data.user.email_confirmed_at) {
+        res.status(403).json({
+          error: 'Supabase Auth has not confirmed email verification yet. Please try again.',
+        });
+        return;
+      }
+
+      otpFailedAttempts.delete(attemptKey);
+      const existingLocal = store.users.get(data.user.id) || findUserByEmail(email);
+      const user = await syncProfileFromSupabaseUser({
+        sbUser: data.user,
+        displayNameOverride: parsed.data.displayName,
+        cfg: supabaseCfg,
+        existingLocal,
+      });
+
+      if (user.suspended || user.accountStatus === 'suspended') {
+        res.status(403).json({ error: 'This account has been suspended. Contact VIRAASAT concierge.' });
+        return;
+      }
+
       store.users.set(user.id, user);
-    } else if (emailVerified) {
-      user.emailVerified = true;
-      user.updatedAt = now;
+      addAuditLog({
+        actorId: user.id,
+        actorEmail: user.email,
+        action: 'EMAIL_OTP_VERIFIED',
+        targetType: 'user',
+        targetId: user.id,
+        outcome: 'success',
+        ipAddress: ip,
+        detail: `Supabase Auth verified email (${user.email}). Dual status: email=${user.emailVerified}, phone=${user.phoneVerified}.`,
+      });
+
+      res.json({
+        ok: true,
+        token: data.session.access_token,
+        refreshToken: data.session.refresh_token,
+        user,
+        dualVerified: user.emailVerified && user.phoneVerified,
+      });
+    } catch (err) {
+      res.status(502).json({
+        error: `Email OTP verification request failed: ${err instanceof Error ? err.message : 'network error'}`,
+      });
+    }
+  });
+
+  // 2A. SEND REAL PHONE SMS OTP VIA SUPABASE AUTH -> CUSTOM SEND SMS HOOK -> MSG91
+  router.post('/auth/otp/phone/send', async (req: AuthedRequest, res: Response) => {
+    const ip = getClientIp(req);
+    if (!authStatus.supabaseAuthConfigured) {
+      res.status(503).json({
+        error:
+          'Supabase Auth is not connected yet. Configure SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SMS_HOOK_SECRET, MSG91_AUTH_KEY, and MSG91_TEMPLATE_ID.',
+        code: 'SUPABASE_AUTH_NOT_CONFIGURED',
+        missingVariables: authStatus.missingVariables,
+      });
+      return;
     }
 
-    const token = signSessionToken(
-      { sub: user.id, email: user.email, role: user.role },
-      SESSION_SECRET
-    );
+    const parsed = phoneOtpSendSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid phone number.' });
+      return;
+    }
+
+    const normalized = normalizeIndianPhone(parsed.data.phone);
+    if (!normalized) {
+      res.status(400).json({
+        error: 'Please enter a valid 10-digit Indian mobile number with +91 country code (e.g. +91 9876543210).',
+      });
+      return;
+    }
+
+    const { intent, captchaToken } = parsed.data;
+    if (intent === 'login') {
+      const captcha = await verifyTurnstileToken({ token: captchaToken, ipAddress: ip, cfg: supabaseCfg });
+      if (!captcha.ok) {
+        res.status(400).json({ error: captcha.error, code: 'CAPTCHA_FAILED' });
+        return;
+      }
+    }
+
+    const rate = otpRequestLimiter.consume(`phone_send:${ip}:${normalized.e164}`);
+    if (!rate.allowed) {
+      addAuditLog({
+        actorId: 'anonymous',
+        actorEmail: normalized.e164,
+        action: 'PHONE_OTP_RATE_LIMITED',
+        targetType: 'auth',
+        outcome: 'denied',
+        ipAddress: ip,
+        detail: 'Exceeded SMS OTP request rate limit.',
+      });
+      res.status(429).json({
+        error: `Too many SMS OTP requests. Please wait ${rate.retryAfterSec}s before trying again.`,
+        retryAfterSec: rate.retryAfterSec,
+      });
+      return;
+    }
+
+    const cooldownKey = `phone:${normalized.e164}`;
+    const cooldown = checkAndRecordResendCooldown(cooldownKey);
+    if (!cooldown.allowed) {
+      res.status(429).json({
+        error: `Please wait ${cooldown.retryAfterSec}s before resending the SMS OTP.`,
+        retryAfterSec: cooldown.retryAfterSec,
+      });
+      return;
+    }
+
+    try {
+      if (intent === 'register') {
+        const authHeader = req.headers.authorization;
+        if (!authHeader?.startsWith('Bearer ')) {
+          res.status(401).json({
+            error: 'Complete Step 1 (Email OTP verification) before binding your mobile number.',
+          });
+          return;
+        }
+        const accessToken = authHeader.slice(7).trim();
+        const authedUser = await resolveAuthenticatedUser(accessToken);
+        if (!authedUser || !authedUser.emailVerified) {
+          res.status(403).json({
+            error: 'Your email must be verified with Supabase Auth before verifying your mobile number.',
+          });
+          return;
+        }
+
+        // Trigger Supabase Auth phone_change OTP -> invokes Custom Send SMS Hook -> MSG91
+        const { error } = await requestSupabasePhoneChangeOtp({
+          accessToken,
+          phoneE164: normalized.e164,
+          cfg: supabaseCfg,
+        });
+
+        if (error) {
+          const mapped = mapSupabaseAuthError(error.message);
+          addAuditLog({
+            actorId: authedUser.id,
+            actorEmail: authedUser.email,
+            action: 'PHONE_OTP_SEND_FAILED',
+            targetType: 'auth',
+            outcome: 'failure',
+            ipAddress: ip,
+            detail: `Supabase phone_change OTP dispatch failed for ${normalized.e164}: ${error.message}`,
+          });
+          res.status(mapped.status).json({ error: mapped.error });
+          return;
+        }
+      } else {
+        // Login via registered mobile number -> Supabase Auth invokes Custom Send SMS Hook -> MSG91
+        const supabase = createSupabaseAnonClient(supabaseCfg);
+        const { error } = await supabase.auth.signInWithOtp({
+          phone: normalized.e164,
+          options: {
+            shouldCreateUser: false,
+            captchaToken,
+          },
+        });
+
+        if (error) {
+          const mapped = mapSupabaseAuthError(error.message);
+          addAuditLog({
+            actorId: 'anonymous',
+            actorEmail: normalized.e164,
+            action: 'PHONE_OTP_SEND_FAILED',
+            targetType: 'auth',
+            outcome: 'failure',
+            ipAddress: ip,
+            detail: `Supabase login SMS OTP dispatch failed for ${normalized.e164}: ${error.message}`,
+          });
+          res.status(mapped.status).json({ error: mapped.error });
+          return;
+        }
+      }
+
+      // IMPORTANT: MSG91 accepting the send request NEVER marks phone_verified = true.
+      otpResendCooldowns.set(cooldownKey, Date.now() + OTP_RESEND_COOLDOWN_MS);
+      otpFailedAttempts.delete(`ver_phone:${normalized.e164}`);
+
+      addAuditLog({
+        actorId: 'anonymous',
+        actorEmail: normalized.e164,
+        action: 'PHONE_OTP_DISPATCHED',
+        targetType: 'auth',
+        targetId: intent,
+        outcome: 'success',
+        ipAddress: ip,
+        detail: `Supabase Auth triggered Send SMS Hook -> MSG91 for ${normalized.e164} (${intent}). Phone remains unverified until OTP confirmation.`,
+      });
+
+      res.json({
+        ok: true,
+        channel: 'phone',
+        normalizedIdentifier: normalized.e164,
+        expiresInSec: Math.floor(OTP_TTL_MS / 1000),
+        resendCooldownSec: Math.floor(OTP_RESEND_COOLDOWN_MS / 1000),
+        message: `A 6-digit SMS OTP has been dispatched via MSG91 to ${normalized.e164}. Enter it within 5 minutes to verify your mobile number.`,
+      });
+    } catch (err) {
+      res.status(502).json({
+        error: `Unable to dispatch SMS OTP via Supabase Auth: ${err instanceof Error ? err.message : 'network error'}`,
+      });
+    }
+  });
+
+  // 2B. VERIFY REAL PHONE SMS OTP VIA SUPABASE AUTH
+  router.post('/auth/otp/phone/verify', async (req: AuthedRequest, res: Response) => {
+    const ip = getClientIp(req);
+    if (!authStatus.supabaseAuthConfigured) {
+      res.status(503).json({
+        error: 'Supabase Auth is not connected yet. Configure Supabase credentials first.',
+        code: 'SUPABASE_AUTH_NOT_CONFIGURED',
+        missingVariables: authStatus.missingVariables,
+      });
+      return;
+    }
+
+    const parsed = phoneOtpVerifySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid SMS OTP payload.' });
+      return;
+    }
+
+    const normalized = normalizeIndianPhone(parsed.data.phone);
+    if (!normalized) {
+      res.status(400).json({ error: 'Invalid Indian mobile number format (+91XXXXXXXXXX).' });
+      return;
+    }
+
+    const code = parsed.data.code.trim();
+    const { intent } = parsed.data;
+
+    const rate = otpVerifyLimiter.consume(`phone_ver:${ip}:${normalized.e164}`);
+    if (!rate.allowed) {
+      res.status(429).json({
+        error: `Too many SMS verification attempts. Wait ${rate.retryAfterSec}s.`,
+        retryAfterSec: rate.retryAfterSec,
+      });
+      return;
+    }
+
+    const attemptKey = `ver_phone:${normalized.e164}`;
+    const lock = isAttemptLocked(attemptKey);
+    if (lock.locked) {
+      res.status(429).json({
+        error: `Maximum SMS verification attempts (${OTP_MAX_ATTEMPTS}) reached. Request a new SMS OTP in ${lock.retryAfterSec}s.`,
+        code: 'MAX_ATTEMPTS',
+        remainingAttempts: 0,
+      });
+      return;
+    }
+
+    try {
+      const authHeader = req.headers.authorization;
+      const existingAccessToken = authHeader?.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : undefined;
+
+      if (intent === 'register' && !existingAccessToken) {
+        res.status(401).json({
+          error: 'Email verification session missing. Please verify your email OTP first.',
+        });
+        return;
+      }
+
+      const supabase = createSupabaseAnonClient(supabaseCfg, existingAccessToken);
+      const { data, error } = await supabase.auth.verifyOtp({
+        phone: normalized.e164,
+        token: code,
+        type: intent === 'register' ? 'phone_change' : 'sms',
+      });
+
+      if (error || !data?.user) {
+        const remaining = recordFailedAttempt(attemptKey);
+        const mapped = mapSupabaseAuthError(error?.message || 'Invalid or expired SMS OTP.');
+        addAuditLog({
+          actorId: 'anonymous',
+          actorEmail: normalized.e164,
+          action: 'PHONE_OTP_VERIFY_FAILED',
+          targetType: 'auth',
+          outcome: 'failure',
+          ipAddress: ip,
+          detail: `Supabase rejected SMS OTP (remaining=${remaining}): ${error?.message || 'no user'}`,
+        });
+        res.status(mapped.status).json({
+          error:
+            remaining === 0
+              ? 'Maximum SMS OTP attempts exceeded. Request a fresh code.'
+              : `${mapped.error} (${remaining} attempt(s) remaining)`,
+          code: remaining === 0 ? 'MAX_ATTEMPTS' : 'INVALID_OTP',
+          remainingAttempts: remaining,
+        });
+        return;
+      }
+
+      // Strictly confirm Supabase Auth actually confirmed the phone number
+      if (!data.user.phone_confirmed_at) {
+        res.status(403).json({
+          error: 'Supabase Auth has not confirmed this mobile number yet. Verification rejected.',
+        });
+        return;
+      }
+
+      otpFailedAttempts.delete(attemptKey);
+      const activeToken = data.session?.access_token || existingAccessToken;
+      if (!activeToken) {
+        res.status(401).json({ error: 'Unable to establish authenticated Supabase session.' });
+        return;
+      }
+
+      const existingLocal =
+        store.users.get(data.user.id) ||
+        (data.user.email ? findUserByEmail(data.user.email) : undefined) ||
+        findUserByPhone(normalized.e164);
+
+      const user = await syncProfileFromSupabaseUser({
+        sbUser: data.user,
+        cfg: supabaseCfg,
+        existingLocal,
+      });
+
+      if (user.suspended || user.accountStatus === 'suspended') {
+        res.status(403).json({ error: 'This account has been suspended. Contact VIRAASAT concierge.' });
+        return;
+      }
+
+      store.users.set(user.id, user);
+      const dualVerified = user.emailVerified && user.phoneVerified;
+
+      if (dualVerified) {
+        addNotification(
+          user.id,
+          'Dual Identity Verification Active',
+          'Both your email address and Indian mobile number are verified via Supabase Auth. Your VIRAASAT account is now active.',
+          'security'
+        );
+      }
+
+      addAuditLog({
+        actorId: user.id,
+        actorEmail: user.email || user.phone,
+        action: 'PHONE_OTP_VERIFIED',
+        targetType: 'user',
+        targetId: user.id,
+        outcome: 'success',
+        ipAddress: ip,
+        detail: `Supabase Auth verified phone ${normalized.e164}. Account status: ${user.accountStatus}.`,
+      });
+
+      res.json({
+        ok: true,
+        token: activeToken,
+        refreshToken: data.session?.refresh_token,
+        user,
+        dualVerified,
+      });
+    } catch (err) {
+      res.status(502).json({
+        error: `SMS OTP verification request failed: ${err instanceof Error ? err.message : 'network error'}`,
+      });
+    }
+  });
+
+  // 3. SUPABASE CUSTOM SEND SMS HOOK -> MSG91 (SERVER-TO-SERVER WEBHOOK)
+  // Receives the exact 6-digit OTP generated by Supabase Auth and forwards it to MSG91.
+  router.post('/webhooks/supabase/send-sms', async (req: AuthedRequest, res: Response) => {
+    const ip = getClientIp(req);
+    const webhookId = String(req.headers['webhook-id'] || '');
+    const webhookTimestamp = String(req.headers['webhook-timestamp'] || '');
+    const webhookSignature = String(req.headers['webhook-signature'] || '');
+    const rawBody = req.rawBody || JSON.stringify(req.body);
+
+    if (!supabaseCfg.smsHookSecret) {
+      res.status(500).json({
+        error: {
+          http_code: 500,
+          message: 'SUPABASE_SMS_HOOK_SECRET is not configured on the server.',
+        },
+      });
+      return;
+    }
+
+    const sigCheck = verifyStandardWebhookSignature({
+      webhookId,
+      webhookTimestamp,
+      webhookSignatureHeader: webhookSignature,
+      rawBody,
+      hookSecret: supabaseCfg.smsHookSecret,
+    });
+
+    if (!sigCheck.ok) {
+      addAuditLog({
+        actorId: 'supabase_sms_hook',
+        actorEmail: 'auth-hook@supabase',
+        action: 'SMS_HOOK_SIGNATURE_REJECTED',
+        targetType: 'webhook',
+        targetId: webhookId || 'missing',
+        outcome: 'denied',
+        ipAddress: ip,
+        detail: `Rejected Supabase Send SMS Hook: ${sigCheck.reason}`,
+      });
+      res.status(401).json({
+        error: { http_code: 401, message: sigCheck.reason },
+      });
+      return;
+    }
+
+    // Prevent webhook replay attacks using webhook-id deduplication
+    if (processedSmsHookIds.has(webhookId)) {
+      res.status(409).json({
+        error: { http_code: 409, message: 'Duplicate webhook-id replay rejected.' },
+      });
+      return;
+    }
+    processedSmsHookIds.add(webhookId);
+    if (processedSmsHookIds.size > 5000) {
+      const first = processedSmsHookIds.values().next().value;
+      if (first) processedSmsHookIds.delete(first);
+    }
+
+    const hookSchema = z.object({
+      user: z.object({
+        id: z.string().min(1),
+        phone: z.string().min(10),
+        email: z.string().optional(),
+      }),
+      sms: z.object({
+        otp: z.string().regex(/^\d{6}$/, 'Supabase SMS Hook OTP must be 6 digits.'),
+      }),
+    });
+
+    const parsed = hookSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: {
+          http_code: 400,
+          message: parsed.error.issues[0]?.message || 'Malformed Supabase Send SMS Hook payload.',
+        },
+      });
+      return;
+    }
+
+    const { phone } = parsed.data.user;
+    const { otp } = parsed.data.sms;
+
+    // Forward the EXACT Supabase-generated OTP to MSG91 (never log the OTP!)
+    const msg91Result = await sendOtpViaMsg91({ phone, otp, cfg: supabaseCfg });
+    if (!msg91Result.ok) {
+      addAuditLog({
+        actorId: parsed.data.user.id,
+        actorEmail: phone,
+        action: 'SMS_HOOK_MSG91_FAILED',
+        targetType: 'webhook',
+        targetId: webhookId,
+        outcome: 'failure',
+        ipAddress: ip,
+        detail: msg91Result.error,
+      });
+      res.status(msg91Result.statusCode).json({
+        error: { http_code: msg91Result.statusCode, message: msg91Result.error },
+      });
+      return;
+    }
 
     addAuditLog({
-      actorId: user.id,
-      actorEmail: user.email,
-      action: 'FIREBASE_GOOGLE_SIGNIN',
-      targetType: 'user',
-      targetId: user.id,
+      actorId: parsed.data.user.id,
+      actorEmail: phone,
+      action: 'SMS_HOOK_MSG91_ACCEPTED',
+      targetType: 'webhook',
+      targetId: msg91Result.requestId,
       outcome: 'success',
-      ipAddress: getClientIp(req),
-      detail: 'Google identity synced. Phone verification required for checkout.',
+      ipAddress: ip,
+      detail: `Forwarded Supabase OTP via MSG91 to ${phone} (requestId=${msg91Result.requestId}). Phone verification pending OTP submission.`,
     });
 
-    res.json({
-      ok: true,
-      token,
-      user,
-      dualVerified: user.emailVerified && user.phoneVerified,
-    });
+    // Supabase Auth requires HTTP 200 JSON `{}` to confirm hook completion
+    res.status(200).json({});
   });
 
   router.get('/auth/me', requireAuth, (req: AuthedRequest, res: Response) => {
@@ -731,9 +1188,17 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
     });
   });
 
-  router.post('/auth/logout', requireAuth, (req: AuthedRequest, res: Response) => {
+  router.post('/auth/logout', requireAuth, async (req: AuthedRequest, res: Response) => {
     if (req.sessionToken) {
       store.revokedTokens.add(req.sessionToken);
+      if (authStatus.supabaseAuthConfigured && supabaseCfg.supabaseServiceRoleKey) {
+        try {
+          const adminClient = createSupabaseAdminClient(supabaseCfg);
+          await adminClient.auth.admin.signOut(req.sessionToken, 'global');
+        } catch {
+          // Local revocation already enforced above
+        }
+      }
     }
     addAuditLog({
       actorId: req.user!.id,
@@ -742,7 +1207,7 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
       targetType: 'auth',
       outcome: 'success',
       ipAddress: getClientIp(req),
-      detail: 'User session revoked server-side.',
+      detail: 'User session revoked in Supabase Auth and server revocation list.',
     });
     res.json({ ok: true });
   });
@@ -2869,7 +3334,16 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
 
   app.use('/api', router);
 
-  return { app, store, secrets: { SESSION_SECRET, OTP_HMAC_SECRET, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET } };
+  return {
+    app,
+    store,
+    secrets: {
+      SESSION_SECRET,
+      RAZORPAY_KEY_SECRET,
+      RAZORPAY_WEBHOOK_SECRET,
+      SMS_HOOK_SECRET: supabaseCfg.smsHookSecret,
+    },
+  };
 }
 
 async function startServer() {

@@ -2,9 +2,10 @@ import crypto from 'node:crypto';
 import type { OtpChannel, UserRole } from '../types/marketplace';
 
 export const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
-export const OTP_RESEND_COOLDOWN_MS = 45 * 1000; // 45 seconds
+export const OTP_RESEND_COOLDOWN_MS = 60 * 1000; // 60 seconds
 export const OTP_MAX_ATTEMPTS = 5;
 export const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+export const WEBHOOK_MAX_AGE_SEC = 5 * 60; // 5-minute replay window
 
 export interface OtpChallengeRecord {
   id: string;
@@ -35,7 +36,38 @@ export function normalizeIdentifier(identifier: string, channel: OtpChannel): st
   const digits = trimmed.replace(/[^\d+]/g, '');
   if (digits.startsWith('+')) return digits;
   if (digits.length === 10) return `+91${digits}`;
+  if (digits.length === 12 && digits.startsWith('91')) return `+${digits}`;
   return `+${digits}`;
+}
+
+/**
+ * Validates and normalizes Indian mobile numbers to E.164 (+91XXXXXXXXXX)
+ * and MSG91 format (91XXXXXXXXXX). Indian mobile numbers must start with 6-9.
+ */
+export function normalizeIndianPhone(input: string): {
+  e164: string;
+  msg91Mobile: string;
+  national10: string;
+} | null {
+  const stripped = input.trim().replace(/[\s\-()]/g, '');
+  let national10 = '';
+  if (/^\+91[6-9]\d{9}$/.test(stripped)) {
+    national10 = stripped.slice(3);
+  } else if (/^91[6-9]\d{9}$/.test(stripped)) {
+    national10 = stripped.slice(2);
+  } else if (/^0[6-9]\d{9}$/.test(stripped)) {
+    national10 = stripped.slice(1);
+  } else if (/^[6-9]\d{9}$/.test(stripped)) {
+    national10 = stripped;
+  } else {
+    return null;
+  }
+
+  return {
+    e164: `+91${national10}`,
+    msg91Mobile: `91${national10}`,
+    national10,
+  };
 }
 
 export function generateNumericOtp(): string {
@@ -89,7 +121,7 @@ export function createOtpChallenge(
 }
 
 export function checkResendCooldown(
-  existing: OtpChallengeRecord | undefined,
+  existing: Pick<OtpChallengeRecord, 'resendAvailableAtMs' | 'consumed'> | undefined,
   nowMs = Date.now()
 ): { allowed: boolean; retryAfterSec: number } {
   if (!existing || existing.consumed) {
@@ -138,6 +170,85 @@ export function verifyOtpChallenge(
     code: remaining === 0 ? 'MAX_ATTEMPTS' : 'INVALID_CODE',
     remainingAttempts: remaining,
   };
+}
+
+/**
+ * Standard Webhooks signing & verification used by Supabase Auth Custom Hooks
+ * (Send SMS Hook / Send Email Hook).
+ * Secret format from Supabase Dashboard: `v1,whsec_<base64>` (or raw `whsec_<base64>`).
+ */
+function decodeStandardWebhookSecret(hookSecret: string): Buffer {
+  const cleaned = hookSecret
+    .trim()
+    .replace(/^v1,/, '')
+    .replace(/^whsec_/, '');
+  return Buffer.from(cleaned, 'base64');
+}
+
+export function signStandardWebhookPayload(params: {
+  webhookId: string;
+  webhookTimestamp: string;
+  rawBody: string;
+  hookSecret: string;
+}): string {
+  const secretKey = decodeStandardWebhookSecret(params.hookSecret);
+  const signedContent = `${params.webhookId}.${params.webhookTimestamp}.${params.rawBody}`;
+  const digest = crypto
+    .createHmac('sha256', secretKey)
+    .update(signedContent)
+    .digest('base64');
+  return `v1,${digest}`;
+}
+
+export function verifyStandardWebhookSignature(params: {
+  webhookId: string;
+  webhookTimestamp: string;
+  webhookSignatureHeader: string;
+  rawBody: string;
+  hookSecret: string;
+  nowSec?: number;
+  maxAgeSec?: number;
+}): { ok: true } | { ok: false; reason: string } {
+  const {
+    webhookId,
+    webhookTimestamp,
+    webhookSignatureHeader,
+    rawBody,
+    hookSecret,
+    nowSec = Math.floor(Date.now() / 1000),
+    maxAgeSec = WEBHOOK_MAX_AGE_SEC,
+  } = params;
+
+  if (!hookSecret || !webhookId || !webhookTimestamp || !webhookSignatureHeader || !rawBody) {
+    return { ok: false, reason: 'Missing required webhook signature headers or secret.' };
+  }
+
+  const ts = Number(webhookTimestamp);
+  if (!Number.isFinite(ts) || Math.abs(nowSec - ts) > maxAgeSec) {
+    return { ok: false, reason: 'Webhook timestamp outside allowed replay protection window.' };
+  }
+
+  const expectedHeader = signStandardWebhookPayload({
+    webhookId,
+    webhookTimestamp,
+    rawBody,
+    hookSecret,
+  });
+  const expectedSig = expectedHeader.slice(3); // strip "v1,"
+
+  const candidates = webhookSignatureHeader
+    .split(/\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  for (const candidate of candidates) {
+    const [version, sig] = candidate.split(',');
+    if (version === 'v1' && sig && timingSafeHexEqual(sig, expectedSig)) {
+      return { ok: true };
+    }
+  }
+
+  return { ok: false, reason: 'Webhook HMAC-SHA256 signature mismatch.' };
 }
 
 export class SlidingWindowRateLimiter {

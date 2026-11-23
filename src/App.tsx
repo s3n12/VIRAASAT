@@ -24,6 +24,7 @@ import { apiRequest } from './lib/api';
 import { getEffectiveProductPrice } from './lib/commerce';
 import { auth } from './lib/firebase';
 import { applySeoMetadata } from './lib/seo';
+import { getBrowserSupabaseClient } from './lib/supabaseClient';
 import type {
   CartItem,
   CmsContent,
@@ -227,7 +228,11 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleAuthenticated = async (newToken: string, newUser: UserProfile) => {
+  const handleAuthenticated = async (
+    newToken: string,
+    newUser: UserProfile,
+    redirectAfterDualVerify = false
+  ) => {
     setToken(newToken);
     setUser(newUser);
     if (newUser.role === 'admin') {
@@ -236,6 +241,18 @@ export default function App() {
       setDashboardPane('seller');
     } else {
       setDashboardPane('customer');
+    }
+
+    if (redirectAfterDualVerify && newUser.emailVerified && newUser.phoneVerified) {
+      setView('dashboard');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      showToast(
+        newUser.role === 'admin'
+          ? 'Signed in as Super Admin.'
+          : newUser.role === 'seller'
+            ? 'Signed in to your Artisan Studio dashboard.'
+            : 'Account verified and activated. Welcome to your Customer Dashboard.'
+      );
     }
 
     try {
@@ -252,12 +269,16 @@ export default function App() {
     if (token) {
       await apiRequest('/api/auth/logout', { method: 'POST', token }).catch(() => {});
     }
+    const sb = getBrowserSupabaseClient();
+    if (sb) {
+      await sb.auth.signOut().catch(() => {});
+    }
     await firebaseSignOut(auth).catch(() => {});
     setToken(null);
     setUser(null);
     setWishlistIds([]);
     setView('home');
-    showToast('Signed out securely. Session revoked.');
+    showToast('Signed out securely. Session revoked in Supabase Auth.');
   };
 
   const handleSelectProduct = (product: Product) => {
