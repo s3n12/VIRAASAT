@@ -81,19 +81,25 @@ export async function sendSupabaseEmailOtpDirect(
 export async function verifySupabaseEmailOtpDirect(emailAddress: string, enteredOtp: string) {
   const supabase = getBrowserSupabaseClient();
   if (!supabase) {
-    return {
-      data: { user: null, session: null },
-      error: new Error(
-        'Browser Supabase client is not configured (set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY).'
-      ),
-    };
+    const configError = new Error(
+      'Browser Supabase client is not configured (set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY).'
+    );
+    console.error('OTP verification failed:', {
+      message: configError.message,
+      status: 503,
+      code: 'SUPABASE_AUTH_NOT_CONFIGURED',
+    });
+    throw configError;
   }
   const normalizedToken = enteredOtp.trim();
   if (!/^\d{6}$/.test(normalizedToken)) {
-    return {
-      data: { user: null, session: null },
-      error: new Error('Enter a valid 6-digit verification code.'),
-    };
+    const validationError = new Error('Enter a valid 6-digit verification code.');
+    console.error('OTP verification failed:', {
+      message: validationError.message,
+      status: 400,
+      code: 'INVALID_OTP_FORMAT',
+    });
+    throw validationError;
   }
   const { data, error } = await supabase.auth.verifyOtp({
     email: emailAddress.trim().toLowerCase(),
@@ -101,8 +107,14 @@ export async function verifySupabaseEmailOtpDirect(emailAddress: string, entered
     type: 'email',
   });
   if (error) {
-    console.error(error.message);
+    console.error('OTP verification failed:', {
+      message: error.message,
+      status: error.status,
+      code: error.code,
+    });
+    throw error;
   }
-  return { data, error };
+  console.log('Verified successfully:', data.user);
+  return data;
 }
 

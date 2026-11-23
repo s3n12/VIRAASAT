@@ -676,14 +676,18 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
     try {
       const supabase = createSupabaseAnonClient(supabaseCfg);
       const { data, error } = await supabase.auth.verifyOtp({
-        email,
-        token: code,
+        email: email.trim().toLowerCase(),
+        token: code.trim(),
         type: 'email',
       });
 
       if (error || !data?.user || !data?.session?.access_token) {
         if (error) {
-          console.error('Supabase verifyOtp (email) failed:', error.message);
+          console.error('OTP verification failed:', {
+            message: error.message,
+            status: error.status,
+            code: error.code,
+          });
         }
         const remaining = recordFailedAttempt(attemptKey);
         const mapped = mapSupabaseAuthError(error?.message || 'Invalid or expired OTP.');
@@ -694,7 +698,7 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
           targetType: 'auth',
           outcome: 'failure',
           ipAddress: ip,
-          detail: `Supabase rejected email OTP (remaining=${remaining}): ${error?.message || 'no session'}`,
+          detail: `Supabase rejected email OTP (remaining=${remaining}, code=${error?.code || 'unknown'}): ${error?.message || 'no session'}`,
         });
         res.status(mapped.status).json({
           error:
@@ -702,6 +706,7 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
               ? 'Maximum verification attempts exceeded. Please request a fresh Email OTP.'
               : `${mapped.error} (${remaining} attempt(s) remaining)`,
           code: remaining === 0 ? 'MAX_ATTEMPTS' : 'INVALID_OTP',
+          ...(error?.code ? { providerCode: error.code } : {}),
           remainingAttempts: remaining,
         });
         return;
@@ -714,6 +719,10 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
         return;
       }
 
+      console.log('Verified successfully:', {
+        userId: data.user.id,
+        emailConfirmedAt: data.user.email_confirmed_at,
+      });
       otpFailedAttempts.delete(attemptKey);
       const existingLocal = store.users.get(data.user.id) || findUserByEmail(email);
       const user = await syncProfileFromSupabaseUser({
