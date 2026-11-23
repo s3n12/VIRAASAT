@@ -37,22 +37,38 @@ export function isBrowserSupabaseConfigured(): boolean {
  * so server-side rate limiting, 60s cooldown, Turnstile verification, and audit logging
  * wrap the exact same `supabase.auth.signInWithOtp({ email })` call.
  */
-export async function sendSupabaseEmailOtpDirect(emailAddress: string) {
+export async function sendSupabaseEmailOtpDirect(
+  emailAddress: string,
+  options?: { shouldCreateUser?: boolean }
+) {
   const supabase = getBrowserSupabaseClient();
   if (!supabase) {
-    return {
-      error: new Error(
-        'Browser Supabase client is not configured (set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY).'
-      ),
-    };
+    const configError = new Error(
+      'Browser Supabase client is not configured (set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY).'
+    );
+    console.error('OTP sending failed:', {
+      message: configError.message,
+      status: 503,
+      code: 'SUPABASE_AUTH_NOT_CONFIGURED',
+    });
+    throw configError;
   }
-  const { error } = await supabase.auth.signInWithOtp({
+  const { data, error } = await supabase.auth.signInWithOtp({
     email: emailAddress.trim().toLowerCase(),
+    options: {
+      shouldCreateUser: options?.shouldCreateUser ?? true,
+    },
   });
   if (error) {
-    console.error(error.message);
+    console.error('OTP sending failed:', {
+      message: error.message,
+      status: error.status,
+      code: error.code,
+    });
+    throw error;
   }
-  return { error };
+  console.log('OTP request successful');
+  return data;
 }
 
 /**

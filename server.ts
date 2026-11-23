@@ -571,7 +571,7 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
     try {
       const supabase = createSupabaseAnonClient(supabaseCfg);
       const { error } = await supabase.auth.signInWithOtp({
-        email,
+        email: email.trim().toLowerCase(),
         options: {
           shouldCreateUser: intent === 'register',
           data: displayName ? { display_name: displayName.trim() } : undefined,
@@ -580,7 +580,11 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
       });
 
       if (error) {
-        console.error('Supabase signInWithOtp (email) failed:', error.message);
+        console.error('OTP sending failed:', {
+          message: error.message,
+          status: error.status,
+          code: error.code,
+        });
         const mapped = mapSupabaseAuthError(error.message);
         addAuditLog({
           actorId: 'anonymous',
@@ -589,12 +593,16 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
           targetType: 'auth',
           outcome: 'failure',
           ipAddress: ip,
-          detail: `Supabase Email OTP send failed: ${error.message}`,
+          detail: `Supabase Email OTP send failed (${error.code || error.status || 'unknown'}): ${error.message}`,
         });
-        res.status(mapped.status).json({ error: mapped.error });
+        res.status(mapped.status).json({
+          error: mapped.error,
+          ...(error.code ? { code: error.code } : {}),
+        });
         return;
       }
 
+      console.log('OTP request successful');
       otpResendCooldowns.set(cooldownKey, Date.now() + OTP_RESEND_COOLDOWN_MS);
       otpFailedAttempts.delete(`ver_email:${email}`);
 
