@@ -41,47 +41,79 @@ function isValidHttpUrl(val: string): boolean {
   }
 }
 
+function pickFirstValidUrl(...candidates: Array<string | undefined>): string {
+  for (const candidate of candidates) {
+    const clean = sanitizeEnvValue(candidate);
+    if (clean && isValidHttpUrl(clean)) return clean;
+  }
+  return '';
+}
+
+function pickFirstEnv(...candidates: Array<string | undefined>): string {
+  for (const candidate of candidates) {
+    const clean = sanitizeEnvValue(candidate);
+    if (clean) return clean;
+  }
+  return '';
+}
+
 export function readSupabaseAuthEnv(
   overrides: Partial<SupabaseAuthEnvConfig> = {}
 ): SupabaseAuthEnvConfig {
-  const rawUrl = sanitizeEnvValue(
-    overrides.supabaseUrl ??
-      process.env.SUPABASE_URL ??
-      process.env.NEXT_PUBLIC_SUPABASE_URL ??
-      process.env.VITE_SUPABASE_URL
-  );
+  const supabaseUrl =
+    overrides.supabaseUrl !== undefined
+      ? pickFirstValidUrl(overrides.supabaseUrl)
+      : pickFirstValidUrl(
+          process.env.SUPABASE_URL,
+          process.env.NEXT_PUBLIC_SUPABASE_URL,
+          process.env.VITE_SUPABASE_URL
+        );
+  const supabaseAnonKey =
+    overrides.supabaseAnonKey !== undefined
+      ? pickFirstEnv(overrides.supabaseAnonKey)
+      : pickFirstEnv(
+          process.env.SUPABASE_ANON_KEY,
+          process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+          process.env.VITE_SUPABASE_ANON_KEY
+        );
   return {
-    supabaseUrl: isValidHttpUrl(rawUrl) ? rawUrl : '',
-    supabaseAnonKey: sanitizeEnvValue(
-      overrides.supabaseAnonKey ??
-        process.env.SUPABASE_ANON_KEY ??
-        process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??
-        process.env.VITE_SUPABASE_ANON_KEY
-    ),
-    supabaseServiceRoleKey: sanitizeEnvValue(
-      overrides.supabaseServiceRoleKey ?? process.env.SUPABASE_SERVICE_ROLE_KEY
-    ),
-    smsHookSecret: sanitizeEnvValue(
-      overrides.smsHookSecret ?? process.env.SUPABASE_SMS_HOOK_SECRET
-    ),
-    msg91AuthKey: sanitizeEnvValue(
-      overrides.msg91AuthKey ?? process.env.MSG91_AUTH_KEY
-    ),
-    msg91TemplateId: sanitizeEnvValue(
-      overrides.msg91TemplateId ?? process.env.MSG91_TEMPLATE_ID
-    ),
+    supabaseUrl,
+    supabaseAnonKey,
+    supabaseServiceRoleKey:
+      overrides.supabaseServiceRoleKey !== undefined
+        ? pickFirstEnv(overrides.supabaseServiceRoleKey)
+        : pickFirstEnv(process.env.SUPABASE_SERVICE_ROLE_KEY),
+    smsHookSecret:
+      overrides.smsHookSecret !== undefined
+        ? pickFirstEnv(overrides.smsHookSecret)
+        : pickFirstEnv(process.env.SUPABASE_SMS_HOOK_SECRET),
+    msg91AuthKey:
+      overrides.msg91AuthKey !== undefined
+        ? pickFirstEnv(overrides.msg91AuthKey)
+        : pickFirstEnv(process.env.MSG91_AUTH_KEY),
+    msg91TemplateId:
+      overrides.msg91TemplateId !== undefined
+        ? pickFirstEnv(overrides.msg91TemplateId)
+        : pickFirstEnv(process.env.MSG91_TEMPLATE_ID),
     msg91SenderId:
-      sanitizeEnvValue(overrides.msg91SenderId ?? process.env.MSG91_SENDER_ID) || 'VRSATP',
+      (overrides.msg91SenderId !== undefined
+        ? pickFirstEnv(overrides.msg91SenderId)
+        : pickFirstEnv(process.env.MSG91_SENDER_ID)) || 'VRSATP',
     msg91OtpVarName:
-      sanitizeEnvValue(overrides.msg91OtpVarName ?? process.env.MSG91_OTP_VAR_NAME) || 'otp',
-    turnstileSecretKey: sanitizeEnvValue(
-      overrides.turnstileSecretKey ?? process.env.TURNSTILE_SECRET_KEY
-    ),
-    turnstileSiteKey: sanitizeEnvValue(
-      overrides.turnstileSiteKey ??
-        process.env.VITE_TURNSTILE_SITE_KEY ??
-        process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY
-    ),
+      (overrides.msg91OtpVarName !== undefined
+        ? pickFirstEnv(overrides.msg91OtpVarName)
+        : pickFirstEnv(process.env.MSG91_OTP_VAR_NAME)) || 'otp',
+    turnstileSecretKey:
+      overrides.turnstileSecretKey !== undefined
+        ? pickFirstEnv(overrides.turnstileSecretKey)
+        : pickFirstEnv(process.env.TURNSTILE_SECRET_KEY),
+    turnstileSiteKey:
+      overrides.turnstileSiteKey !== undefined
+        ? pickFirstEnv(overrides.turnstileSiteKey)
+        : pickFirstEnv(
+            process.env.VITE_TURNSTILE_SITE_KEY,
+            process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY
+          ),
     fetchImpl: overrides.fetchImpl,
   };
 }

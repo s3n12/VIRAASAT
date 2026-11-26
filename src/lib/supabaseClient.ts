@@ -32,6 +32,12 @@ export function isBrowserSupabaseConfigured(): boolean {
 }
 
 /**
+ * Shared browser Supabase client initialized strictly from Vite env vars
+ * (`VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`).
+ */
+export const supabase = getBrowserSupabaseClient();
+
+/**
  * Direct Supabase Auth passwordless Email OTP helper.
  * Note: VIRAASAT's AuthModal routes OTP calls through `/api/auth/otp/email/send`
  * so server-side rate limiting, 60s cooldown, Turnstile verification, and audit logging
