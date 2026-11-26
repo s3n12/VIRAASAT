@@ -439,6 +439,7 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
       ok: true,
       service: 'viraasat-api',
       authProvider: authStatus.supabaseAuthConfigured ? 'supabase_auth' : 'unconfigured',
+      supabaseTable: supabaseCfg.supabaseRawTable,
       smsHookConfigured: authStatus.smsHookConfigured,
       paymentMode: HAS_LIVE_RAZORPAY ? 'razorpay_live' : 'razorpay_sandbox',
       timestamp: new Date().toISOString(),
@@ -454,6 +455,115 @@ export function createViraasatApiApp(options: ServerOptions = {}) {
         .filter((c) => c.active && new Date(c.expiresAt).getTime() > Date.now())
         .map((c) => ({ code: c.code, description: c.description })),
     });
+  });
+
+  // =========================================================================
+  // SUPABASE TABLE BRIDGE: VIRAASAT-RAw (RLS-enforced via Supabase Auth/Anon)
+  // =========================================================================
+  const rawRecordPayloadSchema = z
+    .record(
+      z.string().min(1).max(64),
+      z.union([z.string().max(4000), z.number().finite(), z.boolean(), z.null()])
+    )
+    .refine((obj) => Object.keys(obj).length >= 1 && Object.keys(obj).length <= 30, {
+      message: 'Record payload must contain between 1 and 30 fields.',
+    });
+
+  router.get('/supabase/raw', async (req: AuthedRequest, res: Response) => {
+    if (!authStatus.supabaseAuthConfigured) {
+      res.status(503).json({
+        error: 'Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY.',
+        code: 'SUPABASE_NOT_CONFIGURED',
+      });
+      return;
+    }
+
+    const limitParam = Number(req.query.limit ?? 25);
+    const offsetParam = Number(req.query.offset ?? 0);
+    const limit = Number.isFinite(limitParam) ? Math.min(50, Math.max(1, Math.floor(limitParam))) : 25;
+    const offset = Number.isFinite(offsetParam) ? Math.max(0, Math.floor(offsetParam)) : 0;
+
+    const authHeader = req.headers.authorization;
+    const bearerToken =
+      authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
+
+    try {
+      const supabase = createSupabaseAnonClient(supabaseCfg, bearerToken);
+      const { data, error } = await supabase
+        .from(supabaseCfg.supabaseRawTable)
+        .select('*')
+        .range(offset, offset + limit - 1);
+
+      if (error) {
+        res.status(error.code === '42501' ? 403 : 502).json({
+          error: error.message,
+          code: error.code || 'SUPABASE_QUERY_FAILED',
+          table: supabaseCfg.supabaseRawTable,
+        });
+        return;
+      }
+
+      res.json({
+        table: supabaseCfg.supabaseRawTable,
+        count: data?.length ?? 0,
+        records: data ?? [],
+      });
+    } catch (err) {
+      res.status(502).json({
+        error: `Unable to query Supabase table ${supabaseCfg.supabaseRawTable}: ${err instanceof Error ? err.message : 'network error'}`,
+      });
+    }
+  });
+
+  router.post('/supabase/raw', requireAuth, async (req: AuthedRequest, res: Response) => {
+    if (!authStatus.supabaseAuthConfigured) {
+      res.status(503).json({
+        error: 'Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY.',
+        code: 'SUPABASE_NOT_CONFIGURED',
+      });
+      return;
+    }
+
+    const parsed = rawRecordPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid record payload.',
+      });
+      return;
+    }
+
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(parsed.data)) {
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+      sanitized[key] = value;
+    }
+
+    try {
+      const supabase = createSupabaseAnonClient(supabaseCfg, req.sessionToken);
+      const { data, error } = await supabase
+        .from(supabaseCfg.supabaseRawTable)
+        .insert(sanitized)
+        .select()
+        .single();
+
+      if (error) {
+        res.status(error.code === '42501' ? 403 : 400).json({
+          error: error.message,
+          code: error.code || 'SUPABASE_INSERT_FAILED',
+          table: supabaseCfg.supabaseRawTable,
+        });
+        return;
+      }
+
+      res.status(201).json({
+        table: supabaseCfg.supabaseRawTable,
+        record: data,
+      });
+    } catch (err) {
+      res.status(502).json({
+        error: `Unable to save record to ${supabaseCfg.supabaseRawTable}: ${err instanceof Error ? err.message : 'network error'}`,
+      });
+    }
   });
 
   // =========================================================================
